@@ -338,3 +338,187 @@ public class JwtTokenProviderTest {
 These unit test cases use Mockito to mock the LDAP template and JWT token provider dependencies. They verify the behavior of the service methods and token generation/validation. Make sure to adjust the test data according to your specific LDAP configuration and asymmetric key handling.
 
 Please note that these examples provide a basic implementation of LDAP authentication and JWT token generation without additional security measures like user roles, authorities, or token expiration validation. For a production environment, you should consider additional security aspects and follow best practices for JWT token handling.
+
+Sure! Here's how you can implement the JWT token provider using Nimbus JOSE+JWT library for generating and validating JWT tokens:
+
+1. Add the Nimbus JOSE+JWT library to your project. You can include it as a Maven dependency in your `pom.xml` file:
+
+```xml
+<dependency>
+    <groupId>com.nimbusds</groupId>
+    <artifactId>nimbus-jose-jwt</artifactId>
+    <version>9.11</version>
+</dependency>
+```
+
+2. Create the `JwtTokenProvider` class:
+
+```java
+import com.nimbusds.jose.*;
+import com.nimbusds.jose.crypto.RSASSASigner;
+import com.nimbusds.jose.crypto.RSASSAVerifier;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.NoSuchAlgorithmException;
+import java.security.interfaces.RSAPrivateKey;
+import java.security.interfaces.RSAPublicKey;
+import java.text.ParseException;
+import java.util.Date;
+
+@Component
+public class JwtTokenProvider {
+
+    @Value("${jwt.expirationTime}")
+    private int expirationTime;
+
+    private RSAPrivateKey privateKey;
+    private RSAPublicKey publicKey;
+
+    public JwtTokenProvider() {
+        // Initialize the key pair for signing and verification
+        generateKeyPair();
+    }
+
+    private void generateKeyPair() {
+        try {
+            KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
+            keyPairGenerator.initialize(2048);
+            KeyPair keyPair = keyPairGenerator.genKeyPair();
+            this.privateKey = (RSAPrivateKey) keyPair.getPrivate();
+            this.publicKey = (RSAPublicKey) keyPair.getPublic();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("Error generating RSA key pair for JWT token.", e);
+        }
+    }
+
+    public String generateToken(String username) {
+        Date now = new Date();
+        Date expiration = new Date(now.getTime() + expirationTime * 1000);
+
+        JWTClaimsSet claimsSet = new JWTClaimsSet.Builder()
+                .subject(username)
+                .issueTime(now)
+                .expirationTime(expiration)
+                .build();
+
+        JWSHeader header = new JWSHeader.Builder(JWSAlgorithm.RS256)
+                .type(JOSEObjectType.JWT)
+                .build();
+
+        SignedJWT signedJWT = new SignedJWT(header, claimsSet);
+        try {
+            JWSSigner signer = new RSASSASigner(privateKey);
+            signedJWT.sign(signer);
+            return signedJWT.serialize();
+        } catch (JOSEException e) {
+            throw new RuntimeException("Error signing JWT token.", e);
+        }
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            SignedJWT signedJWT = SignedJWT.parse(token);
+            JWSVerifier verifier = new RSASSAVerifier(publicKey);
+            return signedJWT.verify(verifier) && !isTokenExpired(signedJWT.getJWTClaimsSet());
+        } catch (JOSEException | ParseException e) {
+            return false;
+        }
+    }
+
+    private boolean isTokenExpired(JWTClaimsSet claimsSet) {
+        Date expiration = claimsSet.getExpirationTime();
+        return expiration != null && expiration.before(new Date());
+    }
+}
+```
+
+In this implementation, we use the `generateToken` method to create a new JWT token with the given username as the subject. The `validateToken` method checks the token's signature and expiration time for validation.
+
+Note that this example uses RSA keys for signing and verification. The keys are generated automatically during the initialization of the `JwtTokenProvider`. In a production environment, you should store the keys securely and not generate them on the fly.
+
+Also, make sure you have the `jwt.expirationTime` property defined in your properties file to set the token expiration time in seconds.
+
+3. Update the `SecurityConfig` class (as shown in a previous answer) to use the new `JwtTokenProvider`:
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+
+    @Autowired
+    private LdapUserDetailsService ldapUserDetailsService;
+
+    @Autowired
+    private JwtTokenProvider jwtTokenProvider;
+
+    // ...
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.csrf().disable()
+            .authorizeRequests().anyRequest().authenticated()
+            .and().formLogin()
+            .successHandler(jwtAuthenticationSuccessHandler())
+            .and().apply(new JwtConfigurer(jwtTokenProvider));
+    }
+
+    // ...
+}
+```
+
+4. Implement Unit Test Cases:
+
+Here are some example unit test cases to test the `JwtTokenProvider`:
+
+```java
+import org.junit.Before;
+import org.junit.Test;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+public class JwtTokenProviderTest {
+
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Before
+    public void setUp() {
+        jwtTokenProvider = new JwtTokenProvider();
+    }
+
+    @Test
+    public void testGenerateAndValidateToken() {
+        String username = "testUser";
+        String token = jwtTokenProvider.generateToken(username);
+
+        assertTrue(jwtTokenProvider.validateToken(token));
+    }
+
+    @Test
+    public void testValidateExpiredToken() {
+        String username = "testUser";
+        String token = jwtTokenProvider.generateToken(username);
+
+        // Simulate token expiration by setting the expiration time to a past date
+        jwtTokenProvider.expirationTime = -1;
+        assertFalse(jwtTokenProvider.validateToken(token));
+    }
+
+    @Test
+    public void testValidateInvalidToken() {
+        String invalidToken = "invalidToken";
+        assertFalse(jwtTokenProvider.validateToken(invalidToken));
+    }
+}
+```
+
+In these test cases, we generate a token using the `generateToken` method and then validate it using the `validateToken` method. We also test the case of an expired token and an invalid token.
+
+Please make sure to adjust the test data and token expiration settings according to your requirements.
+
+With this implementation and unit tests, you should have a working JWT token provider using Nimbus JOSE+JWT library in your Spring Framework 5.0 application.
