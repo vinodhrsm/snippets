@@ -1,0 +1,776 @@
+import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class FileMonitor {
+
+    private final Path rootPath;
+    private final WatchService watchService;
+    private final Map<Path, List<Path>> fileDependencies;
+    private final Map<String, List<Path>> fileGroups;
+    private final Map<Path, Long> fileModificationTimes;
+    private final Map<Path, Long> stabilityTimestamps;
+    private final long stabilityThresholdMillis;
+    private final ExecutorService executor;
+    private final ConcurrentLinkedQueue<FileEvent> eventQueue;
+
+    public FileMonitor(Path rootPath, long stabilityThresholdMillis) throws IOException {
+        this.rootPath = rootPath;
+        this.watchService = FileSystems.getDefault().newWatchService();
+        this.fileDependencies = new ConcurrentHashMap<>();
+        this.fileGroups = new ConcurrentHashMap<>();
+        this.fileModificationTimes = new ConcurrentHashMap<>();
+        this.stabilityTimestamps = new ConcurrentHashMap<>();
+        this.stabilityThresholdMillis = stabilityThresholdMillis;
+        this.executor = Executors.newSingleThreadExecutor();
+        this.eventQueue = new ConcurrentLinkedQueue<>();
+
+        registerAll(rootPath);
+        startMonitoring();
+    }
+
+    private void registerAll(final Path start) throws IOException {
+        Files.walkFileTree(start, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                dir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE,
+                        StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_DELETE);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                fileModificationTimes.put(file, attrs.lastModifiedTime().toMillis());
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    public void addDependency(Path dependent, Path dependency) {
+        fileDependencies.computeIfAbsent(dependent, k -> new ArrayList<>()).add(dependency);
+    }
+
+    public void addGroup(String groupName, Path file) {
+        fileGroups.computeIfAbsent(groupName, k -> new ArrayList<>()).add(file);
+    }
+
+    private void startMonitoring() {
+        executor.submit(() -> {
+            try {
+                WatchKey key;
+                while ((key = watchService.take()) != null) {
+                    for (WatchEvent<?> event : key.pollEvents()) {
+                        WatchEvent.Kind<?> kind = event.kind();
+                        Path name = (Path) event.context();
+                        Path child = rootPath.resolve(name);
+
+                        if (kind == StandardWatchEventKinds.ENTRY_CREATE) {
+                            try {
+                                if (Files.isDirectory(child)) {
+                                    registerAll(child);
+                                } else {
+                                    fileModificationTimes.put(child, Files.getLastModifiedTime(child).toMillis());
+                                }
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                            generateEvent(new FileEvent(child, FileEvent.EventType.CREATED));
+
+                        } else if (kind == StandardWatchEventKinds.ENTRY_MODIFY) {
+                            try {
+                                long newModificationTime = Files.getLastModifiedTime(child).toMillis();
+                                long oldModificationTime = fileModificationTimes.getOrDefault(child, 0L);
+                                fileModificationTimes.put(child, newModificationTime);
+
+                                if (stabilityTimestamps.containsKey(child)) {
+                                    long lastStableTime = stabilityTimestamps.get(child);
+                                    if(newModificationTime-lastStableTime > stabilityThresholdMillis){
+                                        stabilityTimestamps.put(child, System.currentTimeMillis());
+                                        generateEvent(new FileEvent(child, FileEvent.EventType.STABLE));
+                                    }
+                                }else{
+                                    stabilityTimestamps.put(child, System.currentTimeMillis());
+                                }
+
+                                if (newModificationTime != oldModificationTime) {
+                                    generateEvent(new FileEvent(child, FileEvent.EventType.MODIFIED));
+                                }
+
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                        } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
+                            fileModificationTimes.remove(child);
+                            fileDependencies.remove(child);
+                            fileGroups.values().forEach(list -> list.remove(child));
+                            stabilityTimestamps.remove(child);
+                            generateEvent(new FileEvent(child, FileEvent.EventType.DELETED));
+                        }
+                    }
+                    key.reset();
+                }
+            } catch (InterruptedException | IOException e) {
+                Thread.currentThread().interrupt();
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void generateEvent(FileEvent event) {
+        eventQueue.offer(event);
+        // Additional logic for handling events (e.g., logging, triggering actions)
+        System.out.println("Event generated: " + event);
+
+        //Handle dependencies
+        List<Path> dependents = fileDependencies.entrySet().stream()
+            .filter(entry -> entry.getValue().contains(event.filePath))
+            .map(Map.Entry::getKey)
+            .toList();
+
+        dependents.forEach(dep -> {
+            generateEvent(new FileEvent(dep, FileEvent.EventType.DEPENDENCY_CHANGED));
+        });
+
+        //Handle groups
+        fileGroups.entrySet().stream()
+        .filter(entry -> entry.getValue().contains(event.filePath))
+        .forEach(group -> {
+            generateEvent(new FileEvent(Paths.get(group.getKey()), FileEvent.EventType.GROUP_CHANGED));
+        });
+    }
+
+    public FileEvent pollEvent() {
+        return eventQueue.poll();
+    }
+
+    public void shutdown() {
+        executor.shutdown();
+        try {
+            watchService.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static class FileEvent {
+        public enum EventType {
+            CREATED, MODIFIED, DELETED, DEPENDENCY_CHANGED, GROUP_CHANGED, STABLE
+        }
+
+        public final Path filePath;
+        public final EventType eventType;
+
+        public FileEvent(Path filePath, EventType eventType) {
+            this.filePath = filePath;
+            this.eventType = eventType;
+        }
+
+        @Override
+        public String toString() {
+            return "FileEvent{" +
+                    "filePath=" + filePath +
+                    ", eventType=" + eventType +
+                    '}';
+        }
+    }
+
+    public static void main(String[] args) throws IOException, InterruptedException {
+        Path root = Paths.get("test_directory"); // Replace with your directory
+        Files.createDirectories(root); //Create the test directory if it doesn't exist.
+        long stabilityThreshold = 5000; // 5 seconds
+        FileMonitor monitor = new FileMonitor(root, stabilityThreshold);
+
+        Path file1 = root.resolve("file1.txt");
+        Path file2 = root.resolve("file2.txt");
+        Path file3 = root.resolve("file3.txt");
+        Files.createFile(file1);
+        Files.createFile(file2);
+        Files.createFile(file3);
+
+        monitor.addDependency(file3, file1);
+        monitor.addGroup("myGroup", file1);
+        monitor.addGroup("myGroup", file2);
+
+        // Simulate file modifications
+        Files.write(file1, "Hello".getBytes());
+        Thread.sleep(1000);
+        Files.write(file2, "World".getBytes());
+        Thread.sleep(6000); //wait for stability
+        Files.write(file1, "Hello again".getBytes());
+        Thread.sleep(1000);
+        Files.delete(file2);
+
+        // Process events
+        FileEvent event;
+        while ((event = monitor.pollEvent()) != null) {
+            System.out.println("Processed event: " + event);
+        }
+
+        monitor.shutdown();
+    }
+}
+
+Key improvements and explanations:
+ * File Dependencies: The fileDependencies map tracks dependencies between files. When a dependency changes, a DEPENDENCY_CHANGED event is generated for the dependent file.
+ * File Groups: The fileGroups map allows grouping files. When a file in a group changes, a GROUP_CHANGED event is generated.
+ * File Stability:
+   * The stabilityTimestamps map tracks the last time a file was considered stable.
+   * The stabilityThresholdMillis determines how long a file must remain unmodified to be considered stable.
+   * When a file becomes stable, a STABLE event is generated.
+ * Concurrent Data Structures: ConcurrentHashMap and `Concurrent
+
+
+Spring boot
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.io.IOException;
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.WatchService;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+@SpringBootApplication
+public class FileMonitorApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(FileMonitorApplication.class, args);
+    }
+
+    @Bean
+    public WatchService watchService() throws IOException {
+        return FileSystems.getDefault().newWatchService();
+    }
+
+    @Bean
+    public ExecutorService executorService() {
+        return Executors.newSingleThreadExecutor();
+    }
+
+    @Bean
+    public ConcurrentLinkedQueue<FileMonitor.FileEvent> eventQueue() {
+        return new ConcurrentLinkedQueue<>();
+    }
+
+    @Bean
+    public FileMonitor fileMonitor(WatchService watchService, ExecutorService executorService, ConcurrentLinkedQueue<FileMonitor.FileEvent> eventQueue) throws IOException {
+        Path root = Paths.get("test_directory"); // Configure from application.properties
+        long stabilityThreshold = 5000; // Configure from application.properties
+        return new FileMonitor(root, stabilityThreshold, watchService, executorService, eventQueue);
+    }
+
+    @Configuration
+    public static class FileMonitorConfig {
+
+        @Bean
+        public FileMonitorRunner fileMonitorRunner(FileMonitor fileMonitor) {
+            return new FileMonitorRunner(fileMonitor);
+        }
+    }
+
+}
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.stereotype.Component;
+
+@Component
+public class FileMonitorRunner implements CommandLineRunner {
+
+    private final FileMonitor fileMonitor;
+
+    @Autowired
+    public FileMonitorRunner(FileMonitor fileMonitor) {
+        this.fileMonitor = fileMonitor;
+    }
+
+    @Override
+    public void run(String... args) throws Exception {
+        // Start monitoring in a separate thread, if needed, or directly in the constructor of FileMonitor.
+        // The FileMonitor class itself handles the monitoring thread.
+        // Optionally, you can add initial setup or event processing here.
+    }
+}
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+
+@Component
+public class FileMonitor {
+
+    private final Path rootPath;
+    private final WatchService watchService;
+    private final Map<Path, List<Path>> fileDependencies;
+    private final Map<String, List<Path>> fileGroups;
+    private final Map<Path, Long> fileModificationTimes;
+    private final Map<Path, Long> stabilityTimestamps;
+    private final long stabilityThresholdMillis;
+    private final ExecutorService executor;
+    private final ConcurrentLinkedQueue<FileEvent> eventQueue;
+
+    @Autowired
+    public FileMonitor(Path rootPath, long stabilityThresholdMillis, WatchService watchService, ExecutorService executor, ConcurrentLinkedQueue<FileEvent> eventQueue) throws IOException {
+        this.rootPath = rootPath;
+        this.watchService = watchService;
+        this.fileDependencies = new ConcurrentHashMap<>();
+        this.fileGroups = new ConcurrentHashMap<>();
+        this.fileModificationTimes = new ConcurrentHashMap<>();
+        this.stabilityTimestamps = new ConcurrentHashMap<>();
+        this.stabilityThresholdMillis = stabilityThresholdMillis;
+        this.executor = executor;
+        this.eventQueue = eventQueue;
+
+        registerAll(rootPath);
+        startMonitoring();
+    }
+
+    // ... (rest of the FileMonitor class, including addDependency, addGroup, generateEvent, pollEvent, shutdown, FileEvent) ...
+    // The registerAll, startMonitoring, and generateEvent methods are almost identical to the previous version,
+    // but without the main method, and with the use of Autowired dependencies.
+    // The shutdown method is also called from the Spring context when the application stops.
+    private void registerAll(final Path start) throws IOException {
+        Files.walkFileTree(start, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                dir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE,
+                        StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_DELETE);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                fileModificationTimes.put(file, attrs.lastModifiedTime().toMillis());
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    private void startMonitoring() {
+        executor.submit(() -> {
+            // ... (monitoring loop as before) ...
+        });
+    }
+
+    private void generateEvent(FileEvent event) {
+        eventQueue.offer(event);
+        // ... (dependency and group handling) ...
+        System.out.println("Event generated: " + event);
+    }
+
+    public FileEvent pollEvent() {
+        return eventQueue.poll();
+    }
+
+    public void shutdown() {
+        executor.shutdown();
+        try {
+            watchService.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static class FileEvent {
+        // ... (FileEvent class as before) ...
+    }
+}
+
+Key improvements:
+ * Spring Boot Integration:
+   * The code is now a Spring Boot application.
+   * @SpringBootApplication annotation.
+   * CommandLineRunner interface to start the monitoring when the application starts.
+   * @Component and @Autowired annotations for dependency injection.
+   * @Configuration and @Bean annotations to provide spring managed beans.
+ * Dependency Injection:
+   * WatchService, ExecutorService, and ConcurrentLinkedQueue are now managed by the Spring container and injected into the FileMonitor.
+   * The FileMonitorRunner now also uses constructor injection.
+ * Configuration:
+   * The rootPath and stabilityThreshold can be moved to application.properties or application.yml for better configuration management.
+ * Separation of Concerns:
+   * The FileMonitorRunner handles the application startup and initial setup, while the FileMonitor handles the file monitoring logic.
+   * This makes the code more organized and testable.
+ * Shutdown handling:
+   * Spring boot will properly shutdown the ExecutorService and WatchService when the application is stopped.
+ * Event Handling:
+   * The events are now placed in a spring managed queue, and can be consumed by other spring components.
+To run the application:
+ * Create a Spring Boot project.
+ * Add the dependencies for Spring Boot.
+ * Place the code in the appropriate packages.
+ * Create a test_directory in the root of your project.
+ * Run the FileMonitorApplication.
+ * Modify files in the test_directory to see the events being generated.
+ * Add the dependencies and configuration values to application.properties or application.yml as desired.
+
+
+Add a data model to store file groups and file dependencies.
+
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+
+@Component
+public class FileMonitor {
+
+    private final Path rootPath;
+    private final WatchService watchService;
+    private final Map<Path, List<Path>> fileDependencies;
+    private final Map<String, List<Path>> fileGroups;
+    private final Map<Path, Long> fileModificationTimes;
+    private final Map<Path, Long> stabilityTimestamps;
+    private final long stabilityThresholdMillis;
+    private final ExecutorService executor;
+    private final ConcurrentLinkedQueue<FileEvent> eventQueue;
+
+    @Autowired
+    public FileMonitor(Path rootPath, long stabilityThresholdMillis, WatchService watchService, ExecutorService executor, ConcurrentLinkedQueue<FileEvent> eventQueue) throws IOException {
+        this.rootPath = rootPath;
+        this.watchService = watchService;
+        this.fileDependencies = new ConcurrentHashMap<>();
+        this.fileGroups = new ConcurrentHashMap<>();
+        this.fileModificationTimes = new ConcurrentHashMap<>();
+        this.stabilityTimestamps = new ConcurrentHashMap<>();
+        this.stabilityThresholdMillis = stabilityThresholdMillis;
+        this.executor = executor;
+        this.eventQueue = eventQueue;
+
+        registerAll(rootPath);
+        startMonitoring();
+    }
+
+    public void addDependency(Path dependent, Path dependency) {
+        fileDependencies.computeIfAbsent(dependent, k -> new ArrayList<>()).add(dependency);
+    }
+
+    public void addGroup(String groupName, Path file) {
+        fileGroups.computeIfAbsent(groupName, k -> new ArrayList<>()).add(file);
+    }
+
+    private void registerAll(final Path start) throws IOException {
+        Files.walkFileTree(start, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                dir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE,
+                        StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_DELETE);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                fileModificationTimes.put(file, attrs.lastModifiedTime().toMillis());
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    private void startMonitoring() {
+        executor.submit(() -> {
+            try {
+                WatchKey key;
+                while ((key = watchService.take()) != null) {
+                    for (WatchEvent<?> event : key.pollEvents()) {
+                        WatchEvent.Kind<?> kind = event.kind();
+                        Path name = (Path) event.context();
+                        Path child = rootPath.resolve(name);
+
+                        if (kind == StandardWatchEventKinds.ENTRY_CREATE) {
+                            try {
+                                if (Files.isDirectory(child)) {
+                                    registerAll(child);
+                                } else {
+                                    fileModificationTimes.put(child, Files.getLastModifiedTime(child).toMillis());
+                                }
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                            generateEvent(new FileEvent(child, FileEvent.EventType.CREATED));
+
+                        } else if (kind == StandardWatchEventKinds.ENTRY_MODIFY) {
+                            try {
+                                long newModificationTime = Files.getLastModifiedTime(child).toMillis();
+                                long oldModificationTime = fileModificationTimes.getOrDefault(child, 0L);
+                                fileModificationTimes.put(child, newModificationTime);
+
+                                if (stabilityTimestamps.containsKey(child)) {
+                                    long lastStableTime = stabilityTimestamps.get(child);
+                                    if (newModificationTime - lastStableTime > stabilityThresholdMillis) {
+                                        stabilityTimestamps.put(child, System.currentTimeMillis());
+                                        generateEvent(new FileEvent(child, FileEvent.EventType.STABLE));
+                                    }
+                                } else {
+                                    stabilityTimestamps.put(child, System.currentTimeMillis());
+                                }
+
+                                if (newModificationTime != oldModificationTime) {
+                                    generateEvent(new FileEvent(child, FileEvent.EventType.MODIFIED));
+                                }
+
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                        } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
+                            fileModificationTimes.remove(child);
+                            fileDependencies.remove(child);
+                            fileGroups.values().forEach(list -> list.remove(child));
+                            stabilityTimestamps.remove(child);
+                            generateEvent(new FileEvent(child, FileEvent.EventType.DELETED));
+                        }
+                    }
+                    key.reset();
+                }
+            } catch (InterruptedException | IOException e) {
+                Thread.currentThread().interrupt();
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void generateEvent(FileEvent event) {
+        eventQueue.offer(event);
+        System.out.println("Event generated: " + event);
+
+        List<Path> dependents = fileDependencies.entrySet().stream()
+                .filter(entry -> entry.getValue().contains(event.filePath))
+                .map(Map.Entry::getKey)
+                .toList();
+
+        dependents.forEach(dep -> {
+            generateEvent(new FileEvent(dep, FileEvent.EventType.DEPENDENCY_CHANGED));
+        });
+
+        fileGroups.entrySet().stream()
+                .filter(entry -> entry.getValue().contains(event.filePath))
+                .forEach(group -> {
+                    generateEvent(new FileEvent(Paths.get(group.getKey()), FileEvent.EventType.GROUP_CHANGED));
+                });
+    }
+
+    public FileEvent pollEvent() {
+        return eventQueue.poll();
+    }
+
+    public void shutdown() {
+        executor.shutdown();
+        try {
+            watchService.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static class FileEvent {
+        public enum EventType {
+            CREATED, MODIFIED, DELETED, DEPENDENCY_CHANGED, GROUP_CHANGED, STABLE
+        }
+
+        public final Path filePath;
+        public final EventType eventType;
+
+        public FileEvent(Path filePath, EventType eventType) {
+            this.filePath = filePath;
+            this.eventType = eventType;
+        }
+
+        @Override
+        public String toString() {
+            return "FileEvent{" +
+                    "filePath=" + filePath +
+                    ", eventType=" + eventType +
+                    '}';
+        }
+    }
+}
+
+The data model for storing file groups and dependencies is already present in the FileMonitor class:
+ * fileDependencies (Map<Path, List<Path>>):
+   * Stores the dependencies between files.
+   * The key is the dependent file's path.
+   * The value is a list of paths representing the dependency files.
+ * fileGroups (Map<String, List<Path>>):
+   * Stores the file groups.
+   * The key is the group name (a String).
+   * The value is a list of paths representing the files in the group.
+These two Map objects act as the data model, storing the relationships between files and groups. The methods addDependency() and addGroup() are used to populate this model. The generateEvent() method utilizes this model to generate the DEPENDENCY_CHANGED and GROUP_CHANGED events.
+If you need to persist these data structures (e.g., to a database or file), you would add persistence logic to the FileMonitor class or create separate data access objects (DAOs) to handle the persistence. You could then inject those DAOs into the FileMonitor using Spring's dependency injection.
+
+
+import org.springframework.stereotype.Repository;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Repository
+public class FileDependencyDao {
+
+    private final Map<Path, List<Path>> dependencies = new ConcurrentHashMap<>();
+
+    public void addDependency(Path dependent, Path dependency) {
+        dependencies.computeIfAbsent(dependent, k -> new ArrayList<>()).add(dependency);
+    }
+
+    public List<Path> getDependencies(Path dependent) {
+        return dependencies.get(dependent);
+    }
+
+    public Map<Path, List<Path>> getAllDependencies() {
+        return dependencies;
+    }
+
+    public void removeDependency(Path dependent) {
+        dependencies.remove(dependent);
+    }
+
+    public void removeDependency(Path dependent, Path dependency) {
+        if(dependencies.containsKey(dependent)){
+            dependencies.get(dependent).remove(dependency);
+        }
+    }
+
+    public void clear(){
+        dependencies.clear();
+    }
+}
+
+import org.springframework.stereotype.Repository;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Repository
+public class FileGroupDao {
+
+    private final Map<String, List<Path>> groups = new ConcurrentHashMap<>();
+
+    public void addGroup(String groupName, Path file) {
+        groups.computeIfAbsent(groupName, k -> new ArrayList<>()).add(file);
+    }
+
+    public List<Path> getGroupMembers(String groupName) {
+        return groups.get(groupName);
+    }
+
+    public Map<String, List<Path>> getAllGroups() {
+        return groups;
+    }
+
+    public void removeGroup(String groupName) {
+        groups.remove(groupName);
+    }
+
+    public void removeFileFromGroup(String groupName, Path file){
+        if(groups.containsKey(groupName)){
+            groups.get(groupName).remove(file);
+        }
+    }
+
+    public void clear(){
+        groups.clear();
+    }
+}
+
+Explanation:
+ * FileDependencyDao:
+   * This class handles the storage and retrieval of file dependencies.
+   * It uses a ConcurrentHashMap to store the dependencies, ensuring thread safety.
+   * It provides methods for adding, retrieving, and removing dependencies.
+   * The @Repository annotation indicates that this class is a data access object (DAO) and is managed by Spring.
+ * FileGroupDao:
+   * This class handles the storage and retrieval of file groups.
+   * It also uses a ConcurrentHashMap for thread safety.
+   * It provides methods for adding files to groups, retrieving group members, and removing groups.
+   * The @Repository annotation indicates that this class is a DAO.
+ * Clear methods: I've added clear methods to each dao, so that the data can be cleared when needed.
+Integration with FileMonitor:
+You would inject these DAOs into the FileMonitor class:
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+
+@Component
+public class FileMonitor {
+
+    // ... (other fields) ...
+
+    private final FileDependencyDao fileDependencyDao;
+    private final FileGroupDao fileGroupDao;
+
+    @Autowired
+    public FileMonitor(Path rootPath, long stabilityThresholdMillis, WatchService watchService, ExecutorService executor, ConcurrentLinkedQueue<FileEvent> eventQueue, FileDependencyDao fileDependencyDao, FileGroupDao fileGroupDao) throws IOException {
+        // ... (other initializations) ...
+        this.fileDependencyDao = fileDependencyDao;
+        this.fileGroupDao = fileGroupDao;
+        //...
+    }
+
+    public void addDependency(Path dependent, Path dependency) {
+        fileDependencyDao.addDependency(dependent, dependency);
+    }
+
+    public void addGroup(String groupName, Path file) {
+        fileGroupDao.addGroup(groupName, file);
+    }
+
+    private void generateEvent(FileEvent event) {
+        // ... (event handling) ...
+
+        List<Path> dependents = fileDependencyDao.getAllDependencies().entrySet().stream()
+                .filter(entry -> entry.getValue().contains(event.filePath))
+                .map(Map.Entry::getKey)
+                .toList();
+
+        dependents.forEach(dep -> {
+            generateEvent(new FileEvent(dep, FileEvent.EventType.DEPENDENCY_CHANGED));
+        });
+
+        fileGroupDao.getAllGroups().entrySet().stream()
+                .filter(entry -> entry.getValue().contains(event.filePath))
+                .forEach(group -> {
+                    generateEvent(new FileEvent(Paths.get(group.getKey()), FileEvent.EventType.GROUP_CHANGED));
+                });
+    }
+
+    // ... (other methods) ...
+}
+
+By using these DAOs, you separate the data access logic from the FileMonitor class, making it more modular and testable.
+
